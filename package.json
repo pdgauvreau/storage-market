@@ -1,0 +1,21 @@
+{
+  "name": "storage-market",
+  "version": "1.0.0",
+  "description": "Decentralized storage marketplace with Merkle proof-of-retrievability (CS 6496)",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "demo": "hardhat run scripts/demo.js",
+    "test:solcjs": "USE_SOLCJS=1 hardhat test",
+    "demo:solcjs": "USE_SOLCJS=1 hardhat run scripts/demo.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.29.2",
+    "solc": "^0.8.24"
+  }
+}
