@@ -1,6 +1,25 @@
 // The USER's program. After handing the file over, the user keeps only: key (secret) + root.
-const { newKey, encrypt, decrypt } = require("./crypto");
+const crypto = require("crypto");
 const { splitIntoChunks, buildTree } = require("./merkle");
+
+// Confidentiality: the file is encrypted BEFORE it leaves the user's machine.
+// AES-256-GCM = encryption + tamper detection.
+// blob = iv (12 bytes) || ciphertext || auth tag (16 bytes). The blob is what gets chunked and stored.
+function encrypt(plaintext, key) {
+  const iv = crypto.randomBytes(12); // fresh random IV per file
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([iv, ciphertext, cipher.getAuthTag()]);
+}
+
+function decrypt(blob, key) {
+  const iv = blob.subarray(0, 12);
+  const tag = blob.subarray(blob.length - 16);
+  const ciphertext = blob.subarray(12, blob.length - 16);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]); // throws if altered
+}
 
 class User {
   constructor(contract) {
@@ -9,7 +28,7 @@ class User {
 
   /** Encrypt, chunk, build the tree. Returns the blob to give to the provider. */
   prepare(plaintext) {
-    this.key = newKey();
+    this.key = crypto.randomBytes(32);
     const blob = encrypt(plaintext, this.key);
     const chunks = splitIntoChunks(blob);
     this.root = buildTree(chunks).root;

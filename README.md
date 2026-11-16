@@ -25,9 +25,8 @@ The code is identical either way.
 | File | Role |
 |---|---|
 | `contracts/StorageMarket.sol` | The smart contract: escrow, deal lifecycle, challenges, Merkle verification, slashing |
-| `offchain/crypto.js` | AES-256-GCM encryption of the file |
 | `offchain/merkle.js` | Chunking and Merkle tree (must hash exactly like the contract) |
-| `offchain/user.js` | User program: encrypt, commit, open deal, claim failure, retrieve and decrypt |
+| `offchain/user.js` | User program: AES-256-GCM encryption, commit, open deal, claim failure, retrieve and decrypt |
 | `offchain/provider.js` | Provider program: store, verify root, accept, answer challenges |
 | `test/StorageMarket.test.js` | Automated tests including cheating providers |
 | `scripts/demo.js` | Narrated demo, prints gas costs |
