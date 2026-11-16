@@ -1,4 +1,4 @@
-// End-to-end demo on a local in-memory chain:  npx hardhat run scripts/demo.js
+// Narrated end-to-end run on a local in-memory chain:   npx hardhat run scripts/demo.js
 const { ethers } = require("hardhat");
 const { mine } = require("@nomicfoundation/hardhat-network-helpers");
 const crypto = require("crypto");
@@ -6,103 +6,74 @@ const { User } = require("../offchain/user");
 const { Provider } = require("../offchain/provider");
 const { getProof } = require("../offchain/merkle");
 
+const PERIODS = 5, PERIOD_BLOCKS = 100, RESPONSE_BLOCKS = 50;
+const PRICE = ethers.parseEther("1"), COLLATERAL = ethers.parseEther("3");
 const eth = (wei) => ethers.formatEther(wei) + " ETH";
-const log = (...a) => console.log(...a);
 
-async function advanceToNextPeriod(market, dealId) {
+async function goToNextPeriod(market, dealId) {
   const d = await market.getDeal(dealId);
-  const target = Number(d.startBlock) + Number(d.nextPeriod) * Number(d.periodBlocks) + 1;
+  const target = Number(d.startBlock) + Number(d.nextPeriod) * PERIOD_BLOCKS + 1;
   const now = await ethers.provider.getBlockNumber();
   if (target > now) await mine(target - now);
 }
 
 async function main() {
-  const [userS, providerS, cheaterS] = await ethers.getSigners();
+  const [userWallet, honestWallet, cheaterWallet] = await ethers.getSigners();
   const market = await (await ethers.getContractFactory("StorageMarket")).deploy();
+  const terms = { numPeriods: PERIODS, periodBlocks: PERIOD_BLOCKS, pricePerPeriod: PRICE, collateral: COLLATERAL };
+  const file = crypto.randomBytes(1024 * 1024); // 1 MB of private data
 
-  const terms = {
-    numPeriods: 5, periodBlocks: 100, responseBlocks: 50, numChallenges: 3, acceptWindowBlocks: 20,
-    pricePerPeriod: ethers.parseEther("1"), collateral: ethers.parseEther("3"),
-  };
-  const file = crypto.randomBytes(1024 * 1024); // 1 MB of "private" data
-
-  // ------------------------------------------------------------------
-  log("\n=== SCENARIO A: honest provider, 1 MB file, 5 periods ===");
-  const user = new User(market.connect(userS));
-  const provider = new Provider(market.connect(providerS));
-
-  let t0 = Date.now();
+  console.log("\n=== A: honest provider ===");
+  const user = new User(market.connect(userWallet));
+  const provider = new Provider(market.connect(honestWallet));
   const blob = user.prepare(file);
-  log(`User encrypted + chunked + built Merkle tree in ${Date.now() - t0} ms`);
-  log(`  file: ${file.length} bytes -> ciphertext blob: ${blob.length} bytes -> ${user.numChunks} chunks of 1024 B`);
-  log(`  user keeps only: root ${user.root} (+ the secret AES key)`);
+  console.log(`1 MB file -> ${blob.length} byte ciphertext -> ${user.numChunks} chunks. User keeps only root ${user.root}`);
 
   provider.store(blob);
-  const { dealId, gasUsed: gasCreate } = await user.createDeal({ provider: providerS.address, ...terms });
-  log(`Deal #${dealId} created, escrow locked: ${eth(terms.pricePerPeriod * BigInt(terms.numPeriods))}   (gas ${gasCreate})`);
+  const created = await user.createDeal({ provider: honestWallet.address, ...terms });
+  console.log(`createDeal: ${eth(PRICE * BigInt(PERIODS))} locked in escrow (gas ${created.gasUsed})`);
+  const accepted = await provider.accept(created.dealId);
+  console.log(`acceptDeal: provider checked the root and locked ${eth(COLLATERAL)} collateral (gas ${accepted.gasUsed})`);
 
-  const acc = await provider.accept(dealId);
-  log(`Provider verified the root, locked collateral ${eth(terms.collateral)}   (gas ${acc.gasUsed})`);
-
-  const proofGas = [];
-  for (let k = 0; k < terms.numPeriods; k++) {
-    await advanceToNextPeriod(market, dealId);
-    const idx = (await market.getChallenge(dealId)).map(Number);
-    const r = await provider.prove(dealId);
-    proofGas.push(r.gasUsed);
-    const bal = await market.balances(providerS.address);
-    log(`Period ${k}: challenged chunks [${idx.join(", ")}] -> proof accepted (gas ${r.gasUsed}); provider balance ${eth(bal)}`);
+  let proofGas = 0n;
+  for (let k = 0; k < PERIODS; k++) {
+    await goToNextPeriod(market, created.dealId);
+    const indices = (await market.getChallenge(created.dealId)).map(Number);
+    const r = await provider.prove(created.dealId);
+    proofGas += r.gasUsed;
+    console.log(`period ${k}: challenged chunks [${indices}] -> proof accepted (gas ${r.gasUsed}), provider balance ${eth(await market.balances(honestWallet.address))}`);
   }
-  const d = await market.getDeal(dealId);
-  log(`Deal status: ${["None","Proposed","Active","Completed","Failed","Cancelled"][Number(d.status)]}`);
-  const back = user.retrieve(blob);
-  log(`User retrieved blob, root matched, decrypted == original: ${back.equals(file)}`);
-  const proofBytes = Number(d.depth) * 32;
-  log(`Proof size per challenge: ${d.depth} siblings x 32 B = ${proofBytes} B (+ 1024 B chunk)`);
+  console.log(`user retrieved + decrypted file correctly: ${user.retrieve(blob).equals(file)}`);
 
-  // ------------------------------------------------------------------
-  log("\n=== SCENARIO B: cheating provider (threw the data away) ===");
-  const user2 = new User(market.connect(userS));
-  const cheater = new Provider(market.connect(cheaterS));
-  const blob2 = user2.prepare(file);
-  cheater.store(blob2);
-  const r2 = await user2.createDeal({ provider: cheaterS.address, ...terms });
-  await cheater.accept(r2.dealId);
-  log(`Deal #${r2.dealId} active. Cheater proves period 0 honestly...`);
-  await advanceToNextPeriod(market, r2.dealId);
-  await cheater.prove(r2.dealId);
+  console.log("\n=== B: cheating provider ===");
+  const user2 = new User(market.connect(userWallet));
+  const cheater = new Provider(market.connect(cheaterWallet));
+  cheater.store(user2.prepare(file));
+  const deal2 = await user2.createDeal({ provider: cheaterWallet.address, ...terms });
+  await cheater.accept(deal2.dealId);
+  await goToNextPeriod(market, deal2.dealId);
+  await cheater.prove(deal2.dealId); // period 0: still has the data
 
-  await advanceToNextPeriod(market, r2.dealId);
-  const idx = (await market.getChallenge(r2.dealId)).map(Number);
-  log(`Period 1 challenge: [${idx.join(", ")}]. Cheater no longer holds those chunks and tries to fake it:`);
+  await goToNextPeriod(market, deal2.dealId);
+  const indices = (await market.getChallenge(deal2.dealId)).map(Number);
+  console.log(`period 1 challenge [${indices}]. Cheater no longer has those chunks, so it tries to fake it:`);
 
-  // Attack 1: answer with a different chunk that it still has, plus that chunk's real proof.
-  const other = idx.map((i) => (i + 1) % cheater.chunks.length);
+  const wrong = indices.map((i) => (i + 1) % cheater.chunks.length); // real chunks from the wrong position
   try {
-    await market.connect(cheaterS).submitProof(r2.dealId, other.map((i) => cheater.chunks[i]), other.map((i) => getProof(cheater.tree, i)));
-    log("  attack 1 (wrong position) -> ACCEPTED?!  BUG");
-  } catch (e) { log("  attack 1 (valid chunk from the wrong position) -> rejected: invalid merkle proof"); }
-
-  // Attack 2: random bytes
+    await market.connect(cheaterWallet).submitProof(deal2.dealId, wrong.map((i) => cheater.chunks[i]), wrong.map((i) => getProof(cheater.tree, i)));
+  } catch { console.log("  chunk from the wrong position -> rejected (invalid merkle proof)"); }
   try {
-    await market.connect(cheaterS).submitProof(r2.dealId, idx.map(() => crypto.randomBytes(1024)), idx.map((i) => getProof(cheater.tree, i)));
-    log("  attack 2 (random bytes) -> ACCEPTED?!  BUG");
-  } catch (e) { log("  attack 2 (random bytes) -> rejected: invalid merkle proof"); }
+    await market.connect(cheaterWallet).submitProof(deal2.dealId, indices.map(() => crypto.randomBytes(1024)), indices.map((i) => getProof(cheater.tree, i)));
+  } catch { console.log("  random bytes -> rejected (invalid merkle proof)"); }
 
-  log("Cheater cannot produce a valid proof, so it stays silent. Waiting for the window to close...");
-  await mine(terms.responseBlocks + 1);
-  const rc = await user2.claimFailure(r2.dealId);
-  log(`User called claimFailure (gas ${rc.gasUsed})`);
-  log(`  user ledger:     ${eth(await market.balances(userS.address))}   (expected 7: collateral 3 + refund of 4 unpaid periods)`);
-  log(`  cheater earned:  ${eth(await market.balances(cheaterS.address))}   (only period 0)`);
+  await mine(RESPONSE_BLOCKS + 1);
+  const failed = await user2.claimFailure(deal2.dealId);
+  console.log(`window closed, user called claimFailure (gas ${failed.gasUsed})`);
+  console.log(`  user ledger:    ${eth(await market.balances(userWallet.address))} (collateral 3 + refund of 4 unpaid periods)`);
+  console.log(`  cheater earned: ${eth(await market.balances(cheaterWallet.address))} (only period 0)`);
 
-  // ------------------------------------------------------------------
-  const avg = proofGas.reduce((a, b) => a + b, 0n) / BigInt(proofGas.length);
-  log("\n=== GAS SUMMARY (1 MB file, depth 11, 3 challenges) ===");
-  log(`createDeal          ${gasCreate}`);
-  log(`acceptDeal          ${acc.gasUsed}`);
-  log(`submitProof (avg)   ${avg}   <- one per period`);
-  log(`claimFailure        ${rc.gasUsed}`);
+  console.log("\n=== gas (1 MB file, depth 11, 3 challenges) ===");
+  console.log(`createDeal ${created.gasUsed} | acceptDeal ${accepted.gasUsed} | submitProof avg ${proofGas / BigInt(PERIODS)} | claimFailure ${failed.gasUsed}`);
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

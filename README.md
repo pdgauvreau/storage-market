@@ -12,7 +12,7 @@ Implemented: everything in the required list (1 MB file tested). Not implemented
 
 ```bash
 npm install
-npx hardhat test          # 16 tests
+npx hardhat test          # 12 tests
 npx hardhat run scripts/demo.js   # narrated end-to-end run with gas numbers
 ```
 
@@ -42,7 +42,7 @@ The code is identical either way.
    `pricePerPeriod * numPeriods` in escrow.
 4. **Accept (provider).** The provider recomputes the root from the data it received and refuses
    unless it matches. Then `acceptDeal` locks the collateral. Period 0 starts at this block.
-5. **Each period.** The contract picks `numChallenges` random chunk positions from the hash of the
+5. **Each period.** The contract picks `NUM_CHALLENGES` (3) random chunk positions from the hash of the
    period's start block. The provider calls `getChallenge` (read-only) to learn them, then
    `submitProof` with those chunks and their Merkle paths. The contract verifies each path against
    the stored root. If all pass, that period's payment is credited to the provider.
@@ -83,7 +83,7 @@ asked about. Limitation: a block producer has a small influence on a block hash.
 systems use a VRF or a randomness beacon (drand, Chainlink VRF).
 
 **Deadlines.** Period `k` starts at `startBlock + k * periodBlocks`. The provider may answer in
-the next `responseBlocks` blocks (at most 255, because `blockhash` only works for the last 256
+the next `RESPONSE_BLOCKS` (50) blocks (this constant must stay at or below 255, because `blockhash` only works for the last 256
 blocks). Deadlines use block numbers, not timestamps, because timestamps can be nudged by block
 producers and blocks are deterministic in tests.
 
@@ -100,7 +100,7 @@ on-chain, so gas per period grows roughly linearly with `c`. Losing a
 single chunk is only caught with probability c/n per period. This is a probabilistic guarantee,
 which is the standard tradeoff in proof-of-retrievability systems.
 
-**Collateral.** Set by the user per deal. It should exceed what the provider could gain by
+**Collateral.** Set by the user per deal (the only economic knob besides price and length). It should exceed what the provider could gain by
 cheating, and a cheater only earns the periods it passes before being caught. The demo uses a
 collateral of 3x the per-period price and a total payment of 5x.
 
@@ -110,14 +110,21 @@ before the transfer. That removes re-entrancy risk from the payout paths.
 **Named provider.** The user names the provider address in `createDeal`. This avoids front-running
 of an open "first to accept" auction and keeps the state machine simple.
 
+**Protocol constants vs. per-deal terms.** Chunk size, number of challenges, response window and
+accept window are fixed constants at the top of the contract, not per-deal options. Every one of them
+is a choice the provider, user and contract must agree on, and fewer knobs means less to explain and
+less to get wrong. Per deal, the user only picks the provider, the number and length of periods, the
+price, and the collateral. The simple flat storage layout costs a bit more gas than a packed one
+(about 90k more on `createDeal`), which I judged worth it for readability.
+
 ## Measured costs (1 MB file, depth 11, 3 challenges)
 
 | Operation | Gas |
 |---|---|
-| `createDeal` | ~210k |
-| `acceptDeal` | ~38k |
+| `createDeal` | ~297k |
+| `acceptDeal` | ~56k |
 | `submitProof` (one period) | ~192k |
-| `claimFailure` | ~60k |
+| `claimFailure` | ~66k |
 
 Off-chain, encrypting and building the tree for 1 MB took about 220 ms.
 
@@ -168,10 +175,10 @@ pays the user the collateral plus every unpaid period. Anyone can trigger it.
 **What if the user disappears?** The provider still gets paid after each proof because the whole
 payment is already in escrow. The user cannot withdraw it.
 
-**What if the provider never accepts?** After `acceptWindowBlocks`, the user calls
+**What if the provider never accepts?** After `ACCEPT_BLOCKS` (20 blocks), the user calls
 `cancelProposal` and gets the escrow back.
 
-**What does a proof cost and how does it scale?** Gas grows with `numChallenges * (chunk size +
+**What does a proof cost and how does it scale?** Gas grows with `NUM_CHALLENGES * (chunk size +
 32 * log2(n))` of calldata plus about `log2(n)` hashes per challenge. Doubling the file adds one
 32-byte sibling per challenge.
 

@@ -1,55 +1,41 @@
-// The USER's program.
-// What the user keeps after handing the file over:  key (secret)  +  root (32 bytes).
-// Everything else (blob, chunks, tree) can be thrown away.
+// The USER's program. After handing the file over, the user keeps only: key (secret) + root.
 const { newKey, encrypt, decrypt } = require("./crypto");
 const { splitIntoChunks, buildTree } = require("./merkle");
 
 class User {
   constructor(contract) {
-    this.contract = contract; // StorageMarket connected to the user's signer
+    this.contract = contract; // StorageMarket connected to the user's wallet
   }
 
-  /**
-   * Encrypt + chunk + build tree.
-   * Returns `blob` (to send to the provider) and remembers only key/root/numChunks.
-   */
+  /** Encrypt, chunk, build the tree. Returns the blob to give to the provider. */
   prepare(plaintext) {
     this.key = newKey();
     const blob = encrypt(plaintext, this.key);
     const chunks = splitIntoChunks(blob);
-    const tree = buildTree(chunks);
-    this.root = tree.root;
+    this.root = buildTree(chunks).root;
     this.numChunks = chunks.length;
     return blob;
   }
 
-  /** Open the deal and escrow the full payment (price * periods). */
-  async createDeal({ provider, numPeriods, periodBlocks, responseBlocks, numChallenges,
-                     acceptWindowBlocks, pricePerPeriod, collateral }) {
-    const terms = {
-      provider, root: this.root, numChunks: this.numChunks, numPeriods, periodBlocks,
-      responseBlocks, numChallenges, acceptWindowBlocks, pricePerPeriod, collateral,
-    };
-    const tx = await this.contract.createDeal(terms, { value: pricePerPeriod * BigInt(numPeriods) });
+  /** Open the deal and escrow price * periods. */
+  async createDeal({ provider, numPeriods, periodBlocks, pricePerPeriod, collateral }) {
+    const tx = await this.contract.createDeal(
+      provider, this.root, this.numChunks, numPeriods, periodBlocks, pricePerPeriod, collateral,
+      { value: pricePerPeriod * BigInt(numPeriods) }
+    );
     const receipt = await tx.wait();
-    const ev = receipt.logs.map((l) => this.contract.interface.parseLog(l)).find((e) => e && e.name === "DealProposed");
-    this.dealId = ev.args.dealId;
+    this.dealId = await this.contract.dealCount();
     return { dealId: this.dealId, gasUsed: receipt.gasUsed };
   }
 
-  /** Provider failed? Anyone can call this, the user does because the user gets paid. */
+  /** Provider missed a deadline: collect collateral + refund. Anyone could call this. */
   async claimFailure(dealId = this.dealId) {
     return (await this.contract.claimFailure(dealId)).wait();
   }
 
-  async withdraw() {
-    return (await this.contract.withdraw()).wait();
-  }
-
-  /** Later: get the blob back from the provider, check it, decrypt it. */
+  /** Get the blob back, check it matches the root we kept, then decrypt. */
   retrieve(blob) {
-    const tree = buildTree(splitIntoChunks(blob));
-    if (tree.root !== this.root) throw new Error("provider returned data that does not match the stored root");
+    if (buildTree(splitIntoChunks(blob)).root !== this.root) throw new Error("data does not match the stored root");
     return decrypt(blob, this.key);
   }
 }

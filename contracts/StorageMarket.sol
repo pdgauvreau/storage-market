@@ -2,149 +2,121 @@
 pragma solidity ^0.8.24;
 
 /**
- * StorageMarket: rent storage from an untrusted provider and pay only while
- * the provider keeps proving it still holds the file.
+ * StorageMarket: rent storage from an untrusted provider, pay only while it proves it still
+ * holds the file.
  *
- * THE BIG PICTURE (good thing to say first in your viva)
- * ------------------------------------------------------
- * 1. The user ENCRYPTS the file, cuts the ciphertext into 1 KB chunks, and builds a
- *    Merkle tree over the chunks. The user keeps only the 32-byte Merkle ROOT
- *    (plus the secret key, which never leaves the user).
- * 2. The user hands the ciphertext to the provider (off-chain) and opens a DEAL on
- *    this contract, locking the whole payment in ESCROW.
- * 3. The provider checks the data matches the root, then ACCEPTS by locking
- *    COLLATERAL.
- * 4. Time is split into PERIODS (measured in blocks). In every period the contract
- *    derives random chunk positions from a block hash. The provider must post those
- *    chunks plus Merkle proofs inside a short RESPONSE WINDOW. A valid proof releases
- *    that period's payment to the provider.
- * 5. If the provider misses a window or posts a bad proof (so no valid proof arrives
- *    in time), anybody can call claimFailure(). The user gets the provider's
- *    collateral plus a refund of every period not yet paid.
- * 6. If the provider proves every period, the deal completes and the collateral is
- *    returned to the provider.
+ * Flow in one breath:
+ *   user encrypts file -> chunks -> Merkle root (user keeps only root + key)
+ *   user createDeal()   -> full payment locked in escrow
+ *   provider acceptDeal() -> collateral locked
+ *   each period: provider submitProof() for random chunks -> that period's payment released
+ *   miss a deadline: claimFailure() -> user gets collateral + refund of unpaid periods
+ *   all periods proven: provider gets collateral back
  *
- * Confidentiality: the chain and the provider only ever see CIPHERTEXT chunks.
+ * The chain and the provider only ever see CIPHERTEXT chunks (the user encrypts first).
  */
 contract StorageMarket {
     // ------------------------------------------------------------------
-    // Constants
+    // PROTOCOL CHOICES (the decisions you should be able to defend)
     // ------------------------------------------------------------------
 
-    /// Size of one chunk in bytes. Fixed for the whole protocol so the user,
-    /// the provider and the contract all agree on how the tree is built.
-    /// 1 MB file -> ~1025 chunks -> proof depth 11 (11 * 32 = 352 bytes of siblings).
+    /// Bytes per chunk. Bigger chunks = shorter proofs but more bytes posted per challenge and a
+    /// coarser spot check. Smaller = longer proofs. 1 KB makes a 1 MB file ~1025 chunks, proof
+    /// depth 11, so one challenge posts about 1024 + 11*32 = 1376 bytes.
     uint256 public constant CHUNK_SIZE = 1024;
 
-    /// blockhash() only works for the most recent 256 blocks, so the response
-    /// window has to fit inside that.
-    uint256 public constant MAX_RESPONSE_BLOCKS = 255;
+    /// Random chunks checked per period. If a provider deleted a fraction f of the file, one period
+    /// catches it with probability 1 - (1-f)^3 (f = 10% -> 27%, f = 50% -> 87.5%). More challenges
+    /// = better detection but more gas per period.
+    uint256 public constant NUM_CHALLENGES = 3;
+
+    /// Blocks the provider has to answer once a period starts. Must stay <= 255 because the
+    /// challenge is derived from blockhash(), which only works for the last 256 blocks.
+    uint256 public constant RESPONSE_BLOCKS = 50;
+
+    /// Blocks the provider has to accept a new deal before the user can cancel and get a refund.
+    uint256 public constant ACCEPT_BLOCKS = 20;
 
     // ------------------------------------------------------------------
     // Data
     // ------------------------------------------------------------------
 
-    enum Status {
-        None,       // id does not exist
-        Proposed,   // user created + funded the deal, provider has not accepted
-        Active,     // provider accepted and posted collateral
-        Completed,  // provider proved every period
-        Failed,     // provider missed a deadline, collateral slashed
-        Cancelled   // provider never accepted, user took the money back
-    }
-
-    /// What the user chooses when creating a deal.
-    struct Terms {
-        address provider;        // who is allowed to accept and prove
-        bytes32 root;            // Merkle root of the ciphertext chunks
-        uint32 numChunks;        // number of real chunks in the file
-        uint32 numPeriods;       // how many proof rounds the deal lasts
-        uint32 periodBlocks;     // length of one period in blocks
-        uint32 responseBlocks;   // blocks the provider has to answer in each period
-        uint32 numChallenges;    // random chunks checked per period
-        uint32 acceptWindowBlocks; // how long the provider has to accept
-        uint256 pricePerPeriod;  // wei paid for each proven period
-        uint256 collateral;      // wei the provider must lock to accept
-    }
+    enum Status { None, Proposed, Active, Completed, Failed, Cancelled }
 
     struct Deal {
         address user;
         address provider;
-        bytes32 root;
-        uint256 pricePerPeriod;
-        uint256 collateral;
-        uint32 numChunks;
-        uint32 numPeriods;
-        uint32 periodBlocks;
-        uint32 responseBlocks;
-        uint32 numChallenges;
-        uint32 nextPeriod;       // index of the next period the provider must prove
-        uint64 startBlock;       // block where period 0 begins (set on accept)
-        uint64 acceptDeadline;   // last block the provider may accept
-        uint8 depth;             // Merkle tree height = ceil(log2(numChunks))
+        bytes32 root;            // Merkle root of the ciphertext chunks
+        uint256 numChunks;       // real chunks in the file
+        uint256 depth;           // tree height = ceil(log2(numChunks)), computed here, not trusted
+        uint256 numPeriods;      // how many proof rounds the deal lasts
+        uint256 periodBlocks;    // blocks per period (must be > RESPONSE_BLOCKS)
+        uint256 pricePerPeriod;  // wei released for each proven period
+        uint256 collateral;      // wei the provider locks to accept
+        uint256 nextPeriod;      // next period the provider must prove (0-based)
+        uint256 startBlock;      // block where period 0 begins (set when accepted)
+        uint256 acceptDeadline;  // last block the provider may accept
         Status status;
     }
 
     uint256 public dealCount;
     mapping(uint256 => Deal) private deals;
 
-    /// Pull-payment ledger. The contract never pushes ether to anyone except
-    /// inside withdraw(), which avoids re-entrancy trouble.
+    /// Pull-payment ledger: money sits here until its owner calls withdraw().
     mapping(address => uint256) public balances;
 
-    // ------------------------------------------------------------------
-    // Events (handy for the demo output and for off-chain programs)
-    // ------------------------------------------------------------------
-
-    event DealProposed(uint256 indexed dealId, address indexed user, address indexed provider, bytes32 root);
-    event DealAccepted(uint256 indexed dealId, uint64 startBlock);
-    event ProofAccepted(uint256 indexed dealId, uint32 period);
+    event DealProposed(uint256 indexed dealId, address indexed user, address indexed provider);
+    event DealAccepted(uint256 indexed dealId);
+    event ProofAccepted(uint256 indexed dealId, uint256 period);
     event DealCompleted(uint256 indexed dealId);
-    event DealFailed(uint256 indexed dealId, uint32 missedPeriod);
-    event DealCancelled(uint256 indexed dealId);
+    event DealFailed(uint256 indexed dealId, uint256 missedPeriod);
 
     // ------------------------------------------------------------------
     // 1. User opens a deal and escrows the full payment
     // ------------------------------------------------------------------
 
-    function createDeal(Terms calldata t) external payable returns (uint256 dealId) {
-        require(t.provider != address(0), "no provider");
-        require(t.numChunks > 0 && t.numPeriods > 0 && t.numChallenges > 0, "zero param");
-        require(t.responseBlocks > 0 && t.responseBlocks <= MAX_RESPONSE_BLOCKS, "bad response window");
-        require(t.responseBlocks < t.periodBlocks, "window must be shorter than period");
-        // The ENTIRE payment is locked up front. This is the "escrow".
-        require(msg.value == t.pricePerPeriod * t.numPeriods, "wrong escrow amount");
+    function createDeal(
+        address provider,
+        bytes32 root,
+        uint256 numChunks,
+        uint256 numPeriods,
+        uint256 periodBlocks,
+        uint256 pricePerPeriod,
+        uint256 collateral
+    ) external payable returns (uint256 dealId) {
+        require(provider != address(0), "no provider");
+        require(numChunks > 0 && numPeriods > 0, "empty deal");
+        require(periodBlocks > RESPONSE_BLOCKS, "period must be longer than response window");
+        require(msg.value == pricePerPeriod * numPeriods, "wrong escrow amount"); // escrow = whole payment
 
-        // Tree height: smallest d with 2^d >= numChunks. We compute it here instead
-        // of trusting a value from the user.
-        uint8 depth = 0;
-        while ((uint256(1) << depth) < t.numChunks) depth++;
+        // Smallest depth with 2^depth >= numChunks.
+        uint256 depth = 0;
+        while ((uint256(1) << depth) < numChunks) depth++;
 
         dealId = ++dealCount;
-        Deal storage d = deals[dealId];
-        d.user = msg.sender;
-        d.provider = t.provider;
-        d.root = t.root;
-        d.pricePerPeriod = t.pricePerPeriod;
-        d.collateral = t.collateral;
-        d.numChunks = t.numChunks;
-        d.numPeriods = t.numPeriods;
-        d.periodBlocks = t.periodBlocks;
-        d.responseBlocks = t.responseBlocks;
-        d.numChallenges = t.numChallenges;
-        d.acceptDeadline = uint64(block.number + t.acceptWindowBlocks);
-        d.depth = depth;
-        d.status = Status.Proposed;
-
-        emit DealProposed(dealId, msg.sender, t.provider, t.root);
+        deals[dealId] = Deal({
+            user: msg.sender,
+            provider: provider,
+            root: root,
+            numChunks: numChunks,
+            depth: depth,
+            numPeriods: numPeriods,
+            periodBlocks: periodBlocks,
+            pricePerPeriod: pricePerPeriod,
+            collateral: collateral,
+            nextPeriod: 0,
+            startBlock: 0,
+            acceptDeadline: block.number + ACCEPT_BLOCKS,
+            status: Status.Proposed
+        });
+        emit DealProposed(dealId, msg.sender, provider);
     }
 
     // ------------------------------------------------------------------
-    // 2. Provider accepts and locks collateral
+    // 2. Provider accepts and locks collateral (or user cancels if it never shows up)
     // ------------------------------------------------------------------
 
-    /// The provider should first download the ciphertext and check that its own
-    /// Merkle root equals deals[dealId].root. Accepting means "I hold this data".
+    /// Provider should first check its own Merkle root equals deals[dealId].root.
     function acceptDeal(uint256 dealId) external payable {
         Deal storage d = deals[dealId];
         require(d.status == Status.Proposed, "not proposed");
@@ -153,11 +125,10 @@ contract StorageMarket {
         require(msg.value == d.collateral, "wrong collateral");
 
         d.status = Status.Active;
-        d.startBlock = uint64(block.number); // period 0 starts now
-        emit DealAccepted(dealId, d.startBlock);
+        d.startBlock = block.number; // period 0 starts now
+        emit DealAccepted(dealId);
     }
 
-    /// If the provider never shows up, the user gets the escrow back.
     function cancelProposal(uint256 dealId) external {
         Deal storage d = deals[dealId];
         require(d.status == Status.Proposed, "not proposed");
@@ -165,76 +136,65 @@ contract StorageMarket {
         require(block.number > d.acceptDeadline, "still waiting for provider");
 
         d.status = Status.Cancelled;
-        balances[d.user] += d.pricePerPeriod * d.numPeriods;
-        emit DealCancelled(dealId);
+        balances[d.user] += d.pricePerPeriod * d.numPeriods; // refund the escrow
     }
 
     // ------------------------------------------------------------------
     // 3. Challenges
+    //
+    //   period k starts at block   start_k = startBlock + k * periodBlocks
+    //   random seed              = blockhash(start_k)   (nobody knows it before that block exists)
+    //   provider may answer in blocks (start_k, start_k + RESPONSE_BLOCKS]
+    //
+    // The seed depends only on the schedule, so neither side can pick or grind it by choosing
+    // when to send a transaction. Limitation: a block producer can nudge a block hash slightly;
+    // real systems use a VRF or a beacon such as drand.
     // ------------------------------------------------------------------
-    //
-    // Timeline for period k (all in blocks):
-    //
-    //   periodStart(k) = startBlock + k * periodBlocks
-    //   challenge seed = blockhash(periodStart(k))      <- unknown until that block exists
-    //   provider may answer in blocks (periodStart, periodStart + responseBlocks]
-    //
-    // Why a block hash? Nobody (not the user, not the provider) can know the random
-    // chunk positions before periodStart is mined, so the provider cannot keep just
-    // "the chunks it expects to be asked about". The caller of any function cannot
-    // choose or grind the seed: it is fixed by the schedule, not by who calls when.
-    // (Limitation: a block producer has a tiny influence on a block hash. Real systems
-    //  use a VRF or a beacon like drand. Good viva point.)
 
-    function periodStart(Deal storage d, uint32 period) private view returns (uint256) {
-        return uint256(d.startBlock) + uint256(period) * d.periodBlocks;
+    function periodStart(Deal storage d, uint256 k) private view returns (uint256) {
+        return d.startBlock + k * d.periodBlocks;
     }
 
-    /// Which chunk positions must be proven in the CURRENT period.
-    /// Providers call this off-chain (eth_call) to know what to fetch from disk.
-    /// It works once the chain has moved at least one block past periodStart, because
-    /// the seed is the hash of that block and a block cannot know its own hash.
+    /// Chunk positions to prove in the CURRENT period. Providers read this off-chain.
+    /// Needs the chain to be at least one block past the period start (a block can't know its own hash).
     function getChallenge(uint256 dealId) public view returns (uint256[] memory indices) {
         Deal storage d = deals[dealId];
         require(d.status == Status.Active, "not active");
-        uint256 ps = periodStart(d, d.nextPeriod);
-        require(block.number > ps, "period not started");
-        require(block.number - ps <= 256, "seed expired");
+        uint256 start = periodStart(d, d.nextPeriod);
+        require(block.number > start, "period not started");
 
-        bytes32 seed = keccak256(abi.encode(blockhash(ps), dealId, d.nextPeriod));
-        indices = new uint256[](d.numChallenges);
-        for (uint256 j = 0; j < d.numChallenges; j++) {
-            // `% numChunks` guarantees we only ever ask for REAL chunks, never padding.
+        bytes32 seed = keccak256(abi.encode(blockhash(start), dealId, d.nextPeriod));
+        indices = new uint256[](NUM_CHALLENGES);
+        for (uint256 j = 0; j < NUM_CHALLENGES; j++) {
+            // "% numChunks" means we only ever ask for real chunks, never padding.
             indices[j] = uint256(keccak256(abi.encode(seed, j))) % d.numChunks;
         }
     }
 
     // ------------------------------------------------------------------
-    // 4. Provider posts proofs; payment is released period by period
+    // 4. Provider posts proofs, payment is released period by period
     // ------------------------------------------------------------------
 
-    /// chunks[j]  = the raw ciphertext bytes of challenged chunk j
-    /// proofs[j]  = the sibling hashes from that chunk's leaf up to the root
+    /// chunks[j] = raw ciphertext of challenged chunk j; proofs[j] = its Merkle sibling hashes.
     function submitProof(uint256 dealId, bytes[] calldata chunks, bytes32[][] calldata proofs) external {
         Deal storage d = deals[dealId];
         require(d.status == Status.Active, "not active");
         require(msg.sender == d.provider, "not the provider");
 
-        uint32 k = d.nextPeriod;
-        uint256 ps = periodStart(d, k);
-        require(block.number > ps && block.number <= ps + d.responseBlocks, "outside response window");
-        require(chunks.length == d.numChallenges && proofs.length == d.numChallenges, "wrong proof count");
+        uint256 start = periodStart(d, d.nextPeriod);
+        require(block.number > start && block.number <= start + RESPONSE_BLOCKS, "outside response window");
+        require(chunks.length == NUM_CHALLENGES && proofs.length == NUM_CHALLENGES, "wrong proof count");
 
-        uint256[] memory idx = getChallenge(dealId);
-        for (uint256 j = 0; j < idx.length; j++) {
+        uint256[] memory indices = getChallenge(dealId);
+        for (uint256 j = 0; j < NUM_CHALLENGES; j++) {
             require(chunks[j].length <= CHUNK_SIZE, "chunk too big");
-            require(_verify(d.root, d.depth, idx[j], chunks[j], proofs[j]), "invalid merkle proof");
+            require(_verify(d.root, d.depth, indices[j], chunks[j], proofs[j]), "invalid merkle proof");
         }
 
-        // All checks passed: release this period's payment to the provider.
-        d.nextPeriod = k + 1;
+        // Everything checked: pay this period.
+        emit ProofAccepted(dealId, d.nextPeriod);
+        d.nextPeriod++;
         balances[d.provider] += d.pricePerPeriod;
-        emit ProofAccepted(dealId, k);
 
         if (d.nextPeriod == d.numPeriods) {
             d.status = Status.Completed;
@@ -244,57 +204,49 @@ contract StorageMarket {
     }
 
     // ------------------------------------------------------------------
-    // 5. Failure: missed deadline -> slash collateral, refund unspent payment
+    // 5. Failure: window closed with no valid proof
     // ------------------------------------------------------------------
 
-    /// Anyone may call this once the response window for the next unproven
-    /// period has closed. (The user will, since they get the money.)
+    /// Anyone can call this once the response window of the next unproven period is over.
     function claimFailure(uint256 dealId) external {
         Deal storage d = deals[dealId];
         require(d.status == Status.Active, "not active");
-
-        uint32 k = d.nextPeriod;
-        require(block.number > periodStart(d, k) + d.responseBlocks, "window still open");
+        uint256 k = d.nextPeriod;
+        require(block.number > periodStart(d, k) + RESPONSE_BLOCKS, "window still open");
 
         d.status = Status.Failed;
-        // Provider already received k * price. The remaining periods were never earned.
-        uint256 refund = d.pricePerPeriod * (d.numPeriods - k);
-        balances[d.user] += d.collateral + refund;
+        // Provider already got k periods. The rest were never earned, so refund them,
+        // and the user also takes the provider's collateral.
+        balances[d.user] += d.collateral + d.pricePerPeriod * (d.numPeriods - k);
         emit DealFailed(dealId, k);
     }
 
     // ------------------------------------------------------------------
-    // Withdraw (pull payment)
+    // Withdraw (the only place ether leaves the contract)
     // ------------------------------------------------------------------
 
     function withdraw() external {
         uint256 amount = balances[msg.sender];
         require(amount > 0, "nothing to withdraw");
-        balances[msg.sender] = 0; // zero BEFORE sending (checks-effects-interactions)
+        balances[msg.sender] = 0; // zero first, then send (stops re-entrancy)
         (bool ok, ) = msg.sender.call{value: amount}("");
         require(ok, "transfer failed");
     }
 
     // ------------------------------------------------------------------
-    // Merkle proof verification
+    // Merkle verification. Tree rules (offchain/merkle.js must match):
+    //   leaf = keccak256(0x00 || chunk)        node = keccak256(0x01 || left || right)
+    //   tree padded with zero hashes up to 2^depth leaves
+    //
+    // * 0x00 vs 0x01 prefixes: a chunk can never be mistaken for an inner node.
+    // * Position binding: the bits of `index` say whether we are the left or right child at each
+    //   level, and the proof must have exactly `depth` siblings. A valid proof for chunk 5 climbs
+    //   to a different root if replayed as chunk 9.
     // ------------------------------------------------------------------
-    //
-    // Tree rules (the off-chain code in offchain/merkle.js must match exactly):
-    //   leaf  = keccak256(0x00 || chunkBytes)
-    //   node  = keccak256(0x01 || left || right)
-    //   the tree is padded with bytes32(0) leaves up to 2^depth leaves
-    //
-    // Two safety ideas:
-    //  * DOMAIN SEPARATION (0x00 vs 0x01 prefix): a 64-byte chunk can never be
-    //    mistaken for "two child hashes", which blocks second-preimage tricks.
-    //  * POSITION BINDING: the bits of `index` decide whether our running hash is the
-    //    LEFT or RIGHT child at each level. The proof length is forced to equal the
-    //    tree depth. So a valid proof for chunk 5 cannot be passed off as chunk 9:
-    //    walking up with index 9's bits would land on a different root.
 
     function _verify(
         bytes32 root,
-        uint8 depth,
+        uint256 depth,
         uint256 index,
         bytes calldata chunk,
         bytes32[] calldata proof
@@ -303,19 +255,15 @@ contract StorageMarket {
 
         bytes32 h = keccak256(abi.encodePacked(bytes1(0x00), chunk));
         for (uint256 level = 0; level < depth; level++) {
-            if (index & 1 == 0) {
-                h = keccak256(abi.encodePacked(bytes1(0x01), h, proof[level])); // we are the left child
+            if (index % 2 == 0) {
+                h = keccak256(abi.encodePacked(bytes1(0x01), h, proof[level]));  // we are the left child
             } else {
-                h = keccak256(abi.encodePacked(bytes1(0x01), proof[level], h)); // we are the right child
+                h = keccak256(abi.encodePacked(bytes1(0x01), proof[level], h));  // we are the right child
             }
-            index >>= 1;
+            index /= 2;
         }
         return h == root;
     }
-
-    // ------------------------------------------------------------------
-    // Views for off-chain programs
-    // ------------------------------------------------------------------
 
     function getDeal(uint256 dealId) external view returns (Deal memory) {
         return deals[dealId];
