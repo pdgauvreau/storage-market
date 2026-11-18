@@ -196,3 +196,12 @@ walk `log2(n)` nodes, so gas grows logarithmically. Appending works similarly us
 (zero) leaf, with the size bumped. A provider that kept the old version fails from the next period
 on, because proofs are checked against the new root. The provider would need to receive the new
 chunk off-chain, and the user must not change the root mid-period (apply updates at period boundaries).
+
+## AI use statement
+
+I used AI as part of this project in a few ways:
+
+- **Planning:** I used it to plan out the steps for the project.
+- **README:** I used it to help build this README file.
+- **Coding tool:** I used it as a coding tool while writing the code.
+- **Study partner:** I used it as a study partner, something to talk the ideas through with as I worked.
